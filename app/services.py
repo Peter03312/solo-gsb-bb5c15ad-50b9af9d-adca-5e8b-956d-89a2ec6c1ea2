@@ -1,17 +1,30 @@
-"""核心业务逻辑：登记 / 核验占用 / 查询 / 撤销 / 改期 / 授权退役改挂 / 额度预留 / 候补。
+"""核心业务逻辑：登记 / 核验占用 / 查询 / 撤销 / 改期 / 授权退役改挂 / 额度预留 / 候补 / 通道冻结。
 
 并发安全
 ========
 所有通道写事务遵守统一的全局加锁顺序，杜绝跨事务死锁：
 
-    **通道咨询锁（region+channel）→ 到期预留结算 → 候补队列处理 →
-    预留/申请/候补行 → 授权行（id 升序）→ 明细行**
+    **通道咨询锁（region+channel）→ 冻结状态闸门 → 到期预留结算 →
+    候补队列处理（冻结通道仅失效不成交）→
+    冻结/恢复/预留/申请/候补行 → 授权行（id 升序）→ 明细行**
 
 通道咨询锁按 ``region+channel`` 分桶：同一通道内的提交、预留、确认、
-取消、撤销、改期、改挂、候补受理与候补成交全部串行判定。授权行只可能被
-同通道事务竞争（授权匹配维度即 region+channel，改挂也要求两端通道一致），
-因此不同通道的事务不会争用同一授权行，跨桶不可能形成等待环；同事务内对
-同一批授权一律按 id 升序 ``SELECT ... FOR UPDATE``。
+取消、撤销、改期、改挂、候补受理与候补成交，以及冻结/恢复全部串行
+判定。授权行只可能被同通道事务竞争（授权匹配维度即 region+channel，
+改挂也要求两端通道一致），因此不同通道的事务不会争用同一授权行，跨桶
+不可能形成等待环；同事务内对同一批授权一律按 id 升序
+``SELECT ... FOR UPDATE``。
+
+通道冻结（region+channel）
+===========================
+``channel_freezes`` 每通道至多一行。冻结期间新的直接发行、额度预留与
+候补受理在业务判定前一律拒绝（``channel_frozen``，不占额、不入队）；
+既有预留确认/取消、申请撤销/改期、授权改挂、候补取消仍可进行，但这些
+操作释放的额度不得使候补成交（队列只做有效期失效结算，不做成交/失败
+判定）。到期预留与候补仍按原有效期惰性结算，冻结不延长。恢复时在同一
+事务、同一把通道咨询锁内先结算到期、再按原受理顺序处理仍有效的候补，
+提交后才放行新请求，故恢复释放的额度必然先归候补。重复同态操作
+（已冻结再 freeze、已恢复再 resume）幂等，不改动原因与变更时刻。
 
 到期释放（惰性结算）
 ====================
@@ -59,6 +72,8 @@ from sqlalchemy.orm import Session, selectinload
 from app import models
 from app.errors import (
     AlreadyRevoked,
+    ChannelFrozen,
+    ChannelNotFound,
     DistributionRejected,
     DistributionRevoked,
     DuplicateMaterialItems,
@@ -84,6 +99,7 @@ from app.errors import (
 from app.schemas import (
     AuthorizationCreate,
     AuthorizationMigrationRequest,
+    ChannelFreezeRequest,
     DistributionCreate,
     DistributionReschedule,
     MaterialCreate,
@@ -147,12 +163,14 @@ def get_authorization(db: Session, authorization_id: int) -> models.Authorizatio
     try:
         _channel_lock(db, auth.region, auth.channel)
         now = utcnow()
+        frozen_row = _channel_is_frozen(db, auth.region, auth.channel)
         _settle_expired(
             db,
             now,
             region=auth.region,
             channel=auth.channel,
             extra_auth_ids=[authorization_id],
+            frozen=frozen_row is not None,
         )
         db.commit()
     except Exception:
@@ -233,6 +251,71 @@ def _channel_lock(db: Session, region: str, channel: str) -> None:
     )
 
 
+def _channel_has_authorization(
+    db: Session, region: str, channel: str
+) -> bool:
+    """通道（region+channel）下是否存在任何授权（含已停用）。
+
+    冻结/恢复/查询以「通道存在授权」为通道存在的判据；停用仅影响新
+    申请匹配，不改变通道归属。
+    """
+    return db.scalar(
+        select(models.Authorization.id)
+        .where(
+            models.Authorization.region == region,
+            models.Authorization.channel == channel,
+        )
+        .limit(1)
+    ) is not None
+
+
+def _get_freeze_row(
+    db: Session, region: str, channel: str
+) -> models.ChannelFreeze | None:
+    """读取通道冻结行（调用方须已持有通道咨询锁；无行=从未冻结）。"""
+    return db.scalar(
+        select(models.ChannelFreeze).where(
+            models.ChannelFreeze.region == region,
+            models.ChannelFreeze.channel == channel,
+        )
+    )
+
+
+def _channel_is_frozen(
+    db: Session, region: str, channel: str
+) -> models.ChannelFreeze | None:
+    """通道处于冻结中则返回冻结行，否则返回 None。"""
+    row = _get_freeze_row(db, region, channel)
+    return row if row is not None and row.status == "frozen" else None
+
+
+def _ensure_channel_exists(
+    db: Session, region: str, channel: str
+) -> None:
+    """不存在任何授权的通道：明确报错（冻结/恢复/查询共用）。"""
+    if not _channel_has_authorization(db, region, channel):
+        raise ChannelNotFound(region, channel)
+
+
+def _freeze_state_out(
+    region: str,
+    channel: str,
+    row: models.ChannelFreeze | None,
+) -> models.ChannelFreeze:
+    """构造对外返回的冻结状态对象；从未冻结的通道呈现 active 空状态。"""
+    if row is not None:
+        return row
+    return models.ChannelFreeze(
+        region=region,
+        channel=channel,
+        status="active",
+        reason=None,
+        changed_at=None,
+        frozen_at=None,
+        resumed_at=None,
+    )
+
+
 def _validate_material_ids(db: Session, material_ids: list[int]) -> None:
     """重复素材 / 未知编号校验（与申请、预留共用）。"""
     counts = Counter(material_ids)
@@ -280,6 +363,8 @@ def _settle_expired(
     region: str | None = None,
     channel: str | None = None,
     extra_auth_ids: list[int] | None = None,
+    *,
+    frozen: bool = False,
 ) -> list[models.Authorization]:
     """在已持有通道咨询锁的前提下，结算到期未确认预留并返回锁定的授权行。
 
@@ -289,7 +374,9 @@ def _settle_expired(
       按 id 升序一次性 ``FOR UPDATE`` 锁定并读取最新行；
     - 逐项条件归还 ``reserved_count``，预留置为 expired；
     - 到期释放额度后按受理顺序重算本通道候补队首（成交会消耗刚释放的
-      额度），随后重新锁定并返回最新授权行；
+      额度），随后重新锁定并返回最新授权行；**通道冻结期间例外**
+      （``frozen=True``）：到期预留仍按原有效期结算释放，但**不触发候补
+      成交**——冻结期间释放的额度不得使候补成交；
     - 调用方随后在同一事务内基于返回的授权行做余量判定。
     """
     resv_stmt = (
@@ -356,8 +443,15 @@ def _settle_expired(
         db.expire_all()
         if region is not None:
             # 到期释放额度后，先重算本通道候补队首（成交会消耗刚释放的
-            # 额度，失败/失效标记会推进队列）。
-            _process_waitlist(db, region, channel, now)
+            # 额度，失败/失效标记会推进队列）。冻结期间仅做有效期失效
+            # 结算，不做成交/失败判定（释放的额度不得使候补成交）。
+            _process_waitlist(
+                db,
+                region,
+                channel,
+                now,
+                allow_fulfill=not frozen,
+            )
         # 候补成交可能消耗了本批授权额度：重新锁定读取最新计数后返回。
         locked = _lock_authorizations(db, lock_ids)
     return locked
@@ -487,9 +581,19 @@ def _candidate_auth_ids(
 
 # ------------------------------------------------------------- 候补队列
 def _process_waitlist(
-    db: Session, region: str, channel: str, now: datetime | None = None
+    db: Session,
+    region: str,
+    channel: str,
+    now: datetime | None = None,
+    *,
+    allow_fulfill: bool = True,
 ) -> int:
     """在通道咨询锁内按受理顺序处理本通道候补队列，返回本轮成交笔数。
+
+    ``allow_fulfill=False``（通道冻结期间）：仍先把已过申请有效期的
+    待成交候补标记为 ``expired``（冻结不延长候补有效期、到期即失效），
+    但**不做任何成交/失败判定**——冻结期间释放的额度不得使候补成交；
+    仍有效的候补齐备留在队首，恢复事务先按原受理顺序统一处理。
 
     处理开始先统一标记本通道已过申请有效期（``expires_at <= now``，
     左闭右开）的待成交候补为 ``expired``（记录失效时刻与
@@ -505,7 +609,10 @@ def _process_waitlist(
     """
     now = now or utcnow()
     # 先统一失效已过申请有效期的候补（队首优先、按原顺序释放位置）。
+    # 冻结期间同样执行：候补仍按原有效期结算，冻结不延长有效期。
     _expire_due_waitlists(db, region, channel, now)
+    if not allow_fulfill:
+        return 0
 
     fulfilled = 0
     while True:
@@ -624,6 +731,14 @@ def create_distribution(
         _channel_lock(db, data.region, data.channel)
         now = utcnow()
 
+        # 2b) 通道冻结期间，新的直接发行明确拒绝（不占额）。
+        freeze_row = _channel_is_frozen(db, data.region, data.channel)
+        if freeze_row is not None:
+            db.rollback()
+            raise ChannelFrozen(
+                data.region, data.channel, freeze_row.reason
+            )
+
         # 3) 预读候选授权 → 与本通道到期预留涉及授权合并后按 id 升序锁定，
         #    同时完成到期结算（到期预留立即释放、参与本次余量判定）。
         candidate_ids = _candidate_auth_ids(
@@ -701,7 +816,7 @@ def create_distribution(
                 )
             )
         db.commit()
-    except DistributionRejected:
+    except (ChannelFrozen, DistributionRejected):
         raise
     except Exception:
         db.rollback()
@@ -749,8 +864,16 @@ def revoke_distribution(
         # 取消/改挂事务互斥，同时杜绝跨事务死锁（一律先取咨询锁）。
         _channel_lock(db, region, channel)
         # 撤销前先结算本通道到期预留（归还 reserved_count），使通道总额度
-        # 视图一致；撤销本身只释放正式占用 used_count。
-        _settle_expired(db, utcnow(), region=region, channel=channel)
+        # 视图一致；撤销本身只释放正式占用 used_count。冻结期间到期预留
+        # 照常结算，但结算与本次撤销释放的额度均不得使候补成交。
+        frozen_row = _channel_is_frozen(db, region, channel)
+        _settle_expired(
+            db,
+            utcnow(),
+            region=region,
+            channel=channel,
+            frozen=frozen_row is not None,
+        )
 
         # 再锁定申请行，串行化对同一申请的并发撤销，复查状态，
         # 保证后续判定基于最新已提交数据（并发双重撤销恰为一次
@@ -810,8 +933,12 @@ def revoke_distribution(
         distribution.revoked_at = datetime.now(timezone.utc)
         db.flush()
 
-        # 撤销释放额度后，按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        # 撤销释放额度后，按受理顺序重算本通道候补队首；冻结期间仅结算
+        # 候补到期失效，不成交（释放的额度保留至恢复时，恢复事务先按
+        # 原顺序处理仍有效候补）。
+        _process_waitlist(
+            db, region, channel, allow_fulfill=frozen_row is None
+        )
         db.commit()
     except (ResourceNotFound, AlreadyRevoked):
         raise
@@ -856,6 +983,7 @@ def reschedule_distribution(
     try:
         # 第一加锁点：通道咨询锁。与提交/预留/确认/取消/撤销/改挂互斥。
         _channel_lock(db, region, channel)
+        frozen_row = _channel_is_frozen(db, region, channel)
 
         # 锁定申请行，复查状态：已撤销申请拒绝改期（即使新时刻为同一瞬间）。
         distribution = db.scalar(
@@ -887,7 +1015,8 @@ def reschedule_distribution(
         own_auth_ids = {item.authorization_id for item in items}
 
         # 新时刻候选授权与原归属授权合并，随本通道到期结算一次性按 id
-        # 升序行锁（到期预留立即释放并参与本次余量判定）。
+        # 升序行锁（到期预留立即释放并参与本次余量判定；冻结期间到期
+        # 预留照常结算，但不触发候补成交）。
         candidate_ids = _candidate_auth_ids(
             db, material_ids, region, channel, data.occur_at
         )
@@ -897,6 +1026,7 @@ def reschedule_distribution(
             region=region,
             channel=channel,
             extra_auth_ids=sorted(set(candidate_ids) | own_auth_ids),
+            frozen=frozen_row is not None,
         )
 
         # 逐项重选：余量扣除本申请原占用，仍计入未到期预留。
@@ -954,8 +1084,11 @@ def reschedule_distribution(
         distribution.occur_at = data.occur_at
         db.flush()
 
-        # 改期搬移可能释放了原授权额度：按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        # 改期搬移可能释放了原授权额度：按受理顺序重算本通道候补队首；
+        # 冻结期间仅结算候补到期失效，不成交。
+        _process_waitlist(
+            db, region, channel, allow_fulfill=frozen_row is None
+        )
         db.commit()
     except (ResourceNotFound, DistributionRevoked, RescheduleRejected):
         raise
@@ -977,6 +1110,12 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
 
     try:
         _channel_lock(db, data.region, data.channel)
+
+        # 通道冻结期间，新的额度预留明确拒绝（不占额）。
+        freeze_row = _channel_is_frozen(db, data.region, data.channel)
+        if freeze_row is not None:
+            db.rollback()
+            raise ChannelFrozen(data.region, data.channel, freeze_row.reason)
 
         candidate_ids = _candidate_auth_ids(
             db, material_ids, data.region, data.channel, data.occur_at
@@ -1053,7 +1192,7 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
                 )
             )
         db.commit()
-    except ReservationRejected:
+    except (ChannelFrozen, ReservationRejected):
         raise
     except Exception:
         db.rollback()
@@ -1159,7 +1298,14 @@ def get_reservation(db: Session, reservation_id: int) -> models.Reservation:
     region, channel = head
     try:
         _channel_lock(db, region, channel)
-        _settle_expired(db, utcnow(), region=region, channel=channel)
+        frozen_row = _channel_is_frozen(db, region, channel)
+        _settle_expired(
+            db,
+            utcnow(),
+            region=region,
+            channel=channel,
+            frozen=frozen_row is not None,
+        )
         db.commit()
     except Exception:
         db.rollback()
@@ -1189,6 +1335,7 @@ def confirm_reservation(
 
     try:
         _channel_lock(db, region, channel)
+        frozen_row = _channel_is_frozen(db, region, channel)
 
         # 本预留涉及的授权行必须纳入统一行锁集合（条件转账需要）。
         item_auth_ids = list(
@@ -1208,6 +1355,7 @@ def confirm_reservation(
             region=region,
             channel=channel,
             extra_auth_ids=item_auth_ids,
+            frozen=frozen_row is not None,
         )
 
         resv = _load_reservation(db, reservation_id, for_update=True)
@@ -1318,6 +1466,7 @@ def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
 
     try:
         _channel_lock(db, region, channel)
+        frozen_row = _channel_is_frozen(db, region, channel)
 
         item_auth_ids = list(
             db.scalars(
@@ -1336,6 +1485,7 @@ def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
             region=region,
             channel=channel,
             extra_auth_ids=item_auth_ids,
+            frozen=frozen_row is not None,
         )
 
         resv = _load_reservation(db, reservation_id, for_update=True)
@@ -1374,8 +1524,11 @@ def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
         resv.cancelled_at = utcnow()
         db.flush()
 
-        # 取消预留释放额度后，按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        # 取消预留释放额度后，按受理顺序重算本通道候补队首；冻结期间
+        # 仅结算候补到期失效，不成交（恢复时再按原顺序统一处理）。
+        _process_waitlist(
+            db, region, channel, allow_fulfill=frozen_row is None
+        )
         db.commit()
     except (
         ResourceNotFound,
@@ -1462,14 +1615,17 @@ def migrate_authorization(
             )
 
         # 2) 第一加锁点：通道咨询锁；随后立即结算本通道到期预留
-        #    （归还 reserved_count），再锁定两端授权行。
+        #    （归还 reserved_count），再锁定两端授权行。冻结期间改挂仍
+        #    允许，但到期结算与迁出释放的额度均不得使候补成交。
         _channel_lock(db, source.region, source.channel)
+        frozen_row = _channel_is_frozen(db, source.region, source.channel)
         locked_rows = _settle_expired(
             db,
             utcnow(),
             region=source.region,
             channel=source.channel,
             extra_auth_ids=[source_id, target_id],
+            frozen=frozen_row is not None,
         )
         by_id = {a.id: a for a in locked_rows}
         source = by_id.get(source_id, source)
@@ -1630,7 +1786,15 @@ def migrate_authorization(
 
         # 改挂后原授权停用、占用迁出：按受理顺序重算本通道候补队首
         # （仍匹配但额度释放的候补可成交；匹配授权已停用的候补标记失败）。
-        _process_waitlist(db, source.region, source.channel)
+        # 冻结期间仅结算候补到期失效、不成交：释放的额度保留至恢复，
+        # 恢复时仍有效的候补按原受理顺序优先处理（授权已不再匹配者
+        # 恢复时标记 failed）。
+        _process_waitlist(
+            db,
+            source.region,
+            source.channel,
+            allow_fulfill=frozen_row is None,
+        )
         db.commit()
     except MigrationRejected:
         db.rollback()
@@ -1667,6 +1831,16 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
         _channel_lock(db, data.region, data.channel)
         now = utcnow()
         expires_at = now + timedelta(minutes=data.ttl_minutes)
+
+        # 通道冻结期间，候补受理明确拒绝：不成交、不入队、不占额。
+        # 到期预留/候补的有效期结算由恢复事务与冻结期间允许的写操作
+        # （确认/取消/撤销/改期/改挂）在同一把通道锁内完成。
+        freeze_row = _channel_is_frozen(db, data.region, data.channel)
+        if freeze_row is not None:
+            db.rollback()
+            raise ChannelFrozen(
+                data.region, data.channel, freeze_row.reason
+            )
 
         candidate_ids = _candidate_auth_ids(
             db, material_ids, data.region, data.channel, data.occur_at
@@ -1776,7 +1950,7 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
         db.add(waitlist)
         db.flush()
         db.commit()
-    except WaitlistRejected:
+    except (ChannelFrozen, WaitlistRejected):
         raise
     except Exception:
         db.rollback()
@@ -1828,10 +2002,18 @@ def get_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
     try:
         now = utcnow()
         _channel_lock(db, region, channel)
-        _settle_expired(db, now, region=region, channel=channel)
+        frozen_row = _channel_is_frozen(db, region, channel)
+        _settle_expired(
+            db,
+            now,
+            region=region,
+            channel=channel,
+            frozen=frozen_row is not None,
+        )
         # 读路径只做申请有效期的惰性失效（不重算成交/失败）：使已过期
-        # 候补立即呈现 expired；授权停用等「不再匹配」仍按既有约定
-        # 等到额度释放类写事务处理队首时才标记 failed。
+        # 候补立即呈现（冻结期间同样失效——冻结不延长有效期）；授权停用
+        # 等「不再匹配」仍按既有约定等到额度释放类写事务或恢复事务处理
+        # 队首时才标记 failed。
         _expire_due_waitlists(db, region, channel, now)
         db.commit()
     except Exception:
@@ -1917,12 +2099,18 @@ def cancel_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
     try:
         now = utcnow()
         _channel_lock(db, region, channel)
-        _settle_expired(db, now, region=region, channel=channel)
+        frozen_row = _channel_is_frozen(db, region, channel)
+        frozen = frozen_row is not None
+        _settle_expired(
+            db, now, region=region, channel=channel, frozen=frozen
+        )
         # 先处理队列：已过申请有效期的候补落库为 expired，不允许再取消。
-        # 这是独立的惰性结算（含可能的成交），须先提交持久化，再在新事务
-        # 中复查目标候补状态——否则随后冲突分支的 rollback 会把失效/成交
-        # 一并回滚。
-        _process_waitlist(db, region, channel, now)
+        # 这是独立的惰性结算（非冻结时含可能的成交；冻结时仅到期失效），
+        # 须先提交持久化，再在新事务中复查目标候补状态——否则随后冲突
+        # 分支的 rollback 会把失效/成交一并回滚。
+        _process_waitlist(
+            db, region, channel, now, allow_fulfill=not frozen
+        )
         db.commit()
 
         waitlist = _load_waitlist(db, waitlist_id, for_update=True)
@@ -1945,8 +2133,9 @@ def cancel_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
         waitlist.cancelled_at = utcnow()
         db.flush()
 
-        # 队首可能因本次取消而变化：按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        # 队首可能因本次取消而变化：按受理顺序重算本通道候补队首；
+        # 冻结期间仅结算到期失效，不成交。
+        _process_waitlist(db, region, channel, allow_fulfill=not frozen)
         db.commit()
     except (
         ResourceNotFound,
@@ -1958,3 +2147,123 @@ def cancel_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
         raise
 
     return _load_waitlist(db, waitlist_id)
+
+
+# ============================================================ 通道额度冻结
+def set_channel_freeze(
+    db: Session, data: ChannelFreezeRequest
+) -> models.ChannelFreeze:
+    """按地区 + 渠道冻结 / 恢复新额度发放（与通道发行事务共用咨询锁）。
+
+    冻结（``action=freeze``，须有原因）：
+      - 通道下必须存在至少一条授权（含已停用），否则 422
+        ``channel_not_found``；
+      - 重复冻结（已 frozen）：**幂等空操作**，原因、``changed_at`` 均不
+        改动，直接返回当前状态。
+
+    恢复（``action=resume``）：
+      - 未冻结通道（含从未冻结）：幂等空操作，返回当前状态；
+      - 否则在同一事务/同一把通道咨询锁内：先把状态翻转为 active，再
+        ①惰性结算本通道到期预留（冻结不延长预留有效期，到期释放额度），
+        ②按**原受理顺序**处理仍有效的候补（过期者先按原有效期标记
+        expired 并释放位置；可整体承接者原子成交；授权不再匹配者标记
+        failed；队首额度不足则停止），随后本通道新请求即可占额。
+        翻转状态先于队列处理，故队列处理期间本通道在语义上已恢复。
+
+    冻结/恢复与并发发行同通道串行（同一把咨询锁），其他通道不受影响。
+    """
+    region, channel = data.region, data.channel
+    try:
+        _channel_lock(db, region, channel)
+        now = utcnow()
+
+        row = _get_freeze_row(db, region, channel)
+
+        if data.action == "freeze":
+            if row is not None and row.status == "frozen":
+                # 重复同态：不改动原因与变更时刻。
+                db.commit()
+                return row
+            # 通道存在性在锁内判定（与并发授权登记串行意义上取最新视图）。
+            _ensure_channel_exists(db, region, channel)
+            if row is None:
+                row = models.ChannelFreeze(
+                    region=region,
+                    channel=channel,
+                    status="frozen",
+                    reason=data.reason,
+                    changed_at=now,
+                    frozen_at=now,
+                    resumed_at=None,
+                )
+                db.add(row)
+            else:
+                row.status = "frozen"
+                row.reason = data.reason
+                row.changed_at = now
+                row.frozen_at = now
+            db.commit()
+
+        else:  # resume
+            if row is None or row.status == "active":
+                # 重复同态（含从未冻结）：不改动变更时刻。通道不存在同样
+                # 明确报错——查询/操作须有明确对象。
+                if row is None:
+                    _ensure_channel_exists(db, region, channel)
+                db.commit()
+                return _freeze_state_out(region, channel, row)
+
+            # 先翻转状态：随后的到期结算与队列处理均按「已恢复」进行
+            # （本事务仍持有通道咨询锁，外部观察不到中间态）。
+            row.status = "active"
+            row.changed_at = now
+            row.resumed_at = now
+            db.flush()
+
+            # 冻结期间到期的预留按原有效期结算释放；冻结期间到期的候补
+            # 在 _process_waitlist 内统一标记 expired；随后按原受理顺序
+            # 处理仍有效的候补，先于恢复后允许的任何新请求占额。
+            _settle_expired(db, now, region=region, channel=channel)
+            _process_waitlist(db, region, channel, now)
+            db.commit()
+    except ChannelNotFound:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(row)
+    return row
+
+
+def get_channel_freeze_state(
+    db: Session, region: str, channel: str
+) -> models.ChannelFreeze:
+    """查询通道当前冻结状态、末次原因与变更时刻。
+
+    通道下不存在任何授权时 422 ``channel_not_found``；从未冻结的通道
+    返回 ``status=active``、``reason=null``、``changed_at=null``。
+    查询在通道咨询锁内顺带做一次到期/失效惰性结算（冻结期间不成交），
+    与预留/候补单条查询的读语义保持一致，但不改变冻结状态本身。
+    """
+    try:
+        _channel_lock(db, region, channel)
+        _ensure_channel_exists(db, region, channel)
+        now = utcnow()
+        frozen_row = _channel_is_frozen(db, region, channel)
+        _settle_expired(
+            db,
+            now,
+            region=region,
+            channel=channel,
+            frozen=frozen_row is not None,
+        )
+        _expire_due_waitlists(db, region, channel, now)
+        row = _get_freeze_row(db, region, channel)
+        db.commit()
+    except ChannelNotFound:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return _freeze_state_out(region, channel, row)

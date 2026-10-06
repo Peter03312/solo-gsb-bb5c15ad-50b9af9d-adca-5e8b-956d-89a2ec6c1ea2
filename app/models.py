@@ -374,3 +374,60 @@ class WaitlistItem(Base):
 
     waitlist: Mapped["Waitlist"] = relationship(back_populates="items")
     material: Mapped["Material"] = relationship()
+
+
+class ChannelFreeze(Base):
+    """通道（region+channel）新额度发放冻结状态。
+
+    每个通道至多一行（唯一约束）。冻结/恢复与该通道全部发行类写事务
+    共用同一把通道咨询锁，因此同通道操作严格串行，不存在「冻结与发行
+    交错」的中间态。
+
+    - ``status = frozen``：新的直接发行、额度预留与候补受理一律拒绝
+      （不占额、不入队）；既有预留仍可确认/取消，已通过申请仍可撤销/
+      改期，改挂仍可进行，但这些操作在冻结期间释放的额度**不得使候补
+      成交**；到期预留与候补仍按各自原有效期惰性结算，冻结不延长。
+    - ``status = active``（恢复）：先按原受理顺序处理本通道仍有效的
+      候补，再允许新请求占额。
+
+    幂等：重复同态操作（已冻结再冻结、已恢复再恢复）不改写任何字段
+    （原因与 ``changed_at`` 保持不变）。冻结时必须填写原因，原因随
+    冻结记录保留；恢复后行保留，``reason`` 仍为末次冻结原因，
+    ``changed_at`` 为最近一次状态变更（冻结/恢复）时刻，
+    ``frozen_at`` / ``resumed_at`` 记录各自末次时刻。
+    """
+
+    __tablename__ = "channel_freezes"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('frozen', 'active')", name="ck_freeze_status"
+        ),
+        # 冻结必须有原因；active 行（恢复后保留的历史行）原因为空。
+        CheckConstraint(
+            "status = 'active' OR reason IS NOT NULL",
+            name="ck_freeze_reason",
+        ),
+        Index("ux_channel_freeze", "region", "channel", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    region: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), default="frozen", nullable=False
+    )
+    # 末次冻结原因；恢复后保留，active 新行（理论上不会出现）为空。
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # 最近一次状态变更（冻结/恢复）时刻；重复同态操作不刷新。
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    frozen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )

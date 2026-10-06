@@ -349,3 +349,64 @@ class WaitlistOut(BaseModel):
     items: list[WaitlistItemOut] = Field(description="候补素材清单")
     # 仅在已成交（status=fulfilled）时随附完整申请。
     distribution: DistributionOut | None = None
+
+
+# ----------------------------------------------------------- 通道额度冻结
+class ChannelFreezeRequest(BaseModel):
+    """按地区 + 渠道临时冻结 / 恢复新额度发放。
+
+    - ``action=freeze``：必须携带非空 ``reason``；
+    - ``action=resume``：恢复时先按原受理顺序处理本通道仍有效的候补，
+      再允许新请求占额；``reason`` 无需提供（提供也忽略）；
+    - 重复同态操作（已冻结再冻结、未冻结再恢复）不改动原因与变更时刻。
+    """
+
+    region: str = Field(min_length=1, max_length=64)
+    channel: str = Field(min_length=1, max_length=64)
+    action: Literal["freeze", "resume"] = Field(
+        description="freeze=冻结新额度发放；resume=恢复（先清理有效候补）"
+    )
+    reason: str | None = Field(
+        default=None,
+        max_length=500,
+        description="冻结原因（action=freeze 时必填非空；恢复时忽略）",
+    )
+
+    @field_validator("region", "channel")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空串")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_reason(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @model_validator(mode="after")
+    def _validate_reason(self) -> "ChannelFreezeRequest":
+        if self.action == "freeze" and not self.reason:
+            raise ValueError("冻结必须填写原因（reason 为非空字符串）")
+        return self
+
+
+class ChannelFreezeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    region: str
+    channel: str
+    # frozen=冻结中（拒绝新直接发行/新预留/候补受理）；active=正常发放。
+    status: Literal["frozen", "active"]
+    # 末次冻结原因（恢复后仍保留；从未冻结的通道查询时为 null）。
+    reason: str | None = None
+    # 最近一次状态变更（冻结/恢复）时刻；重复同态操作不刷新。
+    changed_at: datetime | None = Field(
+        default=None, description="最近一次冻结/恢复变更时刻（带时区）"
+    )
+    frozen_at: datetime | None = None
+    resumed_at: datetime | None = None

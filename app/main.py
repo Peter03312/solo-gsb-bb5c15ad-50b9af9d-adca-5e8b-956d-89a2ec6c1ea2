@@ -19,15 +19,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
         "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
         "已通过申请的改期（原子重选授权）、"
         "授权退役时将未撤销申请一次性改挂到替代授权；"
         "支持 1～30 分钟有效期的发行额度预留（待确认/确认/取消/过期）；"
-        "并支持额度不足时的通道候补队列（按受理顺序成交/失败/取消，"
-        "候补可设 1～1440 分钟申请有效期，到期处理队首时标记 expired 并释放位置）。"
+        "支持额度不足时的通道候补队列（按受理顺序成交/失败/取消，"
+        "候补可设 1～1440 分钟申请有效期，到期处理队首时标记 expired 并释放位置）；"
+        "并支持按地区+渠道临时冻结/恢复新额度发放（冻结期间拒绝新的直接"
+        "发行、额度预留与候补受理；恢复时先按原受理顺序处理仍有效候补）。"
     ),
     lifespan=lifespan,
 )
@@ -280,3 +282,31 @@ def get_waitlist(waitlist_id: int, db: Session = Depends(get_db)):
 )
 def cancel_waitlist(waitlist_id: int, db: Session = Depends(get_db)):
     return services.cancel_waitlist(db, waitlist_id)
+
+
+# ----------------------------------------------------------- 通道额度冻结
+@app.put(
+    "/api/v1/channel-freezes",
+    response_model=schemas.ChannelFreezeOut,
+    tags=["channel-freezes"],
+    summary=(
+        "按地区+渠道冻结/恢复新额度发放：冻结须填写原因；"
+        "恢复时先按原受理顺序处理本通道仍有效的候补，再允许新请求占额"
+    ),
+)
+def set_channel_freeze(
+    body: schemas.ChannelFreezeRequest, db: Session = Depends(get_db)
+):
+    return services.set_channel_freeze(db, body)
+
+
+@app.get(
+    "/api/v1/channel-freezes",
+    response_model=schemas.ChannelFreezeOut,
+    tags=["channel-freezes"],
+    summary="查询通道冻结状态：当前状态、末次原因与变更时刻",
+)
+def get_channel_freeze(
+    region: str, channel: str, db: Session = Depends(get_db)
+):
+    return services.get_channel_freeze_state(db, region, channel)

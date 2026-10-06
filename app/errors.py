@@ -260,3 +260,41 @@ class InvalidWaitlistStatus(APIError):
                 "可选 pending/fulfilled/failed/cancelled/expired"
             ),
         )
+
+
+# ------------------------------------------------------------- 通道额度冻结
+class ChannelNotFound(APIError):
+    """通道（region+channel）下不存在任何授权：无冻结/恢复/查询对象。"""
+
+    def __init__(self, region: str, channel: str):
+        super().__init__(
+            status_code=422,
+            code="channel_not_found",
+            message=(
+                "通道不存在：该地区与渠道下尚无任何授权，"
+                f"region={region!r}, channel={channel!r}"
+            ),
+            details=[{"region": region, "channel": channel}],
+        )
+
+
+class ChannelFrozen(APIError):
+    """冻结期间提交新的直接发行 / 额度预留 / 候补受理：明确拒绝且不占额。"""
+
+    def __init__(self, region: str, channel: str, reason: str | None):
+        super().__init__(
+            status_code=422,
+            code="channel_frozen",
+            message=(
+                f"通道已冻结新额度发放（region={region!r}, "
+                f"channel={channel!r}），新的直接发行、额度预留与候补受理"
+                f"均被拒绝；冻结原因：{reason or '（未记录）'}"
+            ),
+            details=[
+                {
+                    "region": region,
+                    "channel": channel,
+                    "reason": reason,
+                }
+            ],
+        )
