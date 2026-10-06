@@ -260,3 +260,58 @@ class InvalidWaitlistStatus(APIError):
                 "可选 pending/fulfilled/failed/cancelled/expired"
             ),
         )
+
+
+# --------------------------------------------------------------- 通道冻结
+class ChannelFrozen(APIError):
+    """通道冻结中：新的直接发行/额度预留/候补受理一律拒绝且不占额。"""
+
+    def __init__(self, region: str, channel: str):
+        super().__init__(
+            status_code=422,
+            code="channel_frozen",
+            message=(
+                f"通道（region={region}, channel={channel}）额度发放已冻结："
+                "新的直接发行、额度预留与候补受理均被拒绝且不占额"
+            ),
+            details=[{"region": region, "channel": channel}],
+        )
+
+
+class FreezeReasonRequired(APIError):
+    """冻结通道必须填写冻结原因。"""
+
+    def __init__(self):
+        super().__init__(
+            status_code=422,
+            code="freeze_reason_required",
+            message="冻结通道必须填写冻结原因（reason）",
+        )
+
+
+class InvalidFreezeStatus(APIError):
+    """冻结/恢复状态值非法（仅接受 frozen / active）。"""
+
+    def __init__(self, value: str):
+        super().__init__(
+            status_code=422,
+            code="invalid_freeze_status",
+            message=(
+                f"不支持的冻结状态：{value}；可选 frozen（冻结）/active（恢复）"
+            ),
+        )
+
+
+class ChannelWithoutAuthorization(APIError):
+    """目标通道（region+channel）不存在任何授权，无可冻结/恢复的额度通道。"""
+
+    def __init__(self, region: str, channel: str):
+        super().__init__(
+            status_code=422,
+            code="channel_without_authorization",
+            message=(
+                f"通道（region={region}, channel={channel}）不存在任何授权，"
+                "无法冻结/恢复"
+            ),
+            details=[{"region": region, "channel": channel}],
+        )

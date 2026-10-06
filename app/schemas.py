@@ -349,3 +349,56 @@ class WaitlistOut(BaseModel):
     items: list[WaitlistItemOut] = Field(description="候补素材清单")
     # 仅在已成交（status=fulfilled）时随附完整申请。
     distribution: DistributionOut | None = None
+
+
+# --------------------------------------------------------------- 通道冻结
+class ChannelFreezeSetRequest(BaseModel):
+    """按地区+渠道临时冻结新额度发放（frozen）或恢复（active）。
+
+    - ``status=frozen`` 时 ``reason`` 必填（非空，最长 500 字）；
+    - ``status=active`` 恢复时不需要原因（给了也忽略）。
+    """
+
+    region: str = Field(min_length=1, max_length=64, description="地区")
+    channel: str = Field(min_length=1, max_length=64, description="渠道")
+    # 仅接受 frozen / active；非法值由业务层返回 invalid_freeze_status（422）。
+    status: str = Field(description="frozen=冻结新额度发放；active=恢复")
+    reason: str | None = Field(
+        default=None, max_length=500, description="冻结原因（冻结时必填）"
+    )
+
+    @field_validator("region", "channel")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空串")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_reason(cls, v: str | None) -> str | None:
+        if v is not None:
+            v = v.strip()
+        return v or None
+
+
+class ChannelFreezeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    region: str = Field(description="地区")
+    channel: str = Field(description="渠道")
+    # frozen=冻结中；active=正常（无冻结记录的通道查询时也派生为 active）。
+    status: Literal["frozen", "active"]
+    reason: str | None = Field(
+        default=None, description="冻结原因（仅 frozen 有值）"
+    )
+    frozen_at: datetime | None = Field(
+        default=None, description="冻结时刻（重复同态冻结不更新）"
+    )
+    unfrozen_at: datetime | None = Field(
+        default=None, description="恢复时刻（重复同态恢复不更新）"
+    )
+    changed_at: datetime | None = Field(
+        default=None, description="最近一次冻结/恢复状态变更时刻；从未冻结过为 null"
+    )

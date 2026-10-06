@@ -358,6 +358,63 @@ class Waitlist(Base):
     distribution: Mapped["Distribution | None"] = relationship()
 
 
+class ChannelFreeze(Base):
+    """通道（region+channel）额度冻结记录：每行对应一个通道的当前状态。
+
+    - ``status=frozen``：新的直接发行、额度预留与候补受理一律拒绝且不占额；
+      既有预留仍可确认/取消、已通过申请仍可撤销/改期、授权仍可改挂，但
+      这些操作释放的额度不得使候补成交；到期预留与候补有效期仍按原有效期
+      惰性结算（冻结不延长任何有效期）。
+    - ``status=active``：通道已恢复；恢复事务在通道咨询锁内先按原受理顺序
+      处理仍有效候补，再放通新请求占额。
+
+    重复同态操作（已冻结再冻结、已恢复再恢复）幂等，不改写原因与变更时刻。
+    ``(region, channel)`` 唯一；冻结/恢复通过 upsert 在通道咨询锁内串行。
+    """
+
+    __tablename__ = "channel_freezes"
+    __table_args__ = (
+        CheckConstraint("status IN ('frozen', 'active')", name="ck_cf_status"),
+        # frozen 必须带原因与冻结时刻；active（恢复态）原因清空、
+        # frozen_at 清空，unfrozen_at 记录恢复时刻。
+        CheckConstraint(
+            "status = 'active' OR "
+            "(char_length(reason) BETWEEN 1 AND 500 AND frozen_at IS NOT NULL)",
+            name="ck_cf_frozen_reason",
+        ),
+        CheckConstraint(
+            "status = 'frozen' OR "
+            "(reason IS NULL AND frozen_at IS NULL)",
+            name="ck_cf_active_cleared",
+        ),
+        Index("ix_channel_freezes_pair", "region", "channel", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    region: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    # frozen=冻结中；active=已恢复（或行由恢复动作保留为活动态）。
+    status: Mapped[str] = mapped_column(
+        String(16), default="frozen", nullable=False
+    )
+    # 冻结原因：仅 frozen 有值；恢复时清空（重复冻结须重新提供原因）。
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    frozen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    unfrozen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 最近一次状态变更时刻（冻结→frozen_at，恢复→unfrozen_at）；
+    # 重复同态操作不更新该时刻。
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class WaitlistItem(Base):
     """候补中的素材清单（成交时按既有匹配规则重新选择授权，故不固化授权）。"""
 

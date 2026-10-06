@@ -1,6 +1,6 @@
 # 素材发行授权核验 HTTP API
 
-为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），以及额度不足时的**通道候补队列**（候补可设 **1～1440 分钟申请有效期**，按受理顺序成交/失败/取消/**到期失效**，新直接申请不抢候补额度）。
+为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），额度不足时的**通道候补队列**（候补可设 **1～1440 分钟申请有效期**，按受理顺序成交/失败/取消/**到期失效**，新直接申请不抢候补额度），以及发行团队按**地区+渠道临时冻结/恢复新额度发放**（冻结期新直接发行、额度预留与候补受理一律拒绝；恢复时先按受理顺序处理积压候补）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Pydantic v2
 - 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放、候补不重复成交**
@@ -55,8 +55,9 @@ docker compose down -v       # 停止并删除数据库数据卷（清空全部�
 
 数据库表在应用启动事件中通过 `Base.metadata.create_all` 幂等创建，**无需手工执行迁移**。
 预留功能新增的 `authorizations.reserved_count` 列与 `ck_auth_reserved_invariant`
-约束，以及候补功能新增的 `waitlists` / `waitlist_items` 表，也会在启动时
-对旧版本库**幂等补齐**（列/约束/表已存在则跳过）。
+约束、候补功能新增的 `waitlists` / `waitlist_items` 表，以及通道冻结功能
+新增的 `channel_freezes` 表，也会在启动时对旧版本库**幂等补齐**
+（列/约束/表已存在则跳过）。
 
 ### 不用 Docker 的本地运行方式
 
@@ -93,6 +94,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/waitlists` | 查询候补列表（`?status=pending/fulfilled/failed/cancelled/expired` 过滤） |
 | `GET` | `/waitlists/{id}` | 查询候补（状态、有效期/失效信息、失败原因及生成的申请编号） |
 | `POST` | `/waitlists/{id}/cancel` | **取消待成交候补**（仅 `pending` 可取消；已成交的请撤销其申请；已失效返回 409） |
+| `PUT` | `/channel-freezes` | **按地区+渠道冻结/恢复新额度发放**（冻结须填 `reason`） |
+| `GET` | `/channel-freezes/{region}/{channel}` | 查询单通道冻结状态、原因与变更时刻 |
+| `GET` | `/channel-freezes` | 查询通道冻结状态列表（`?status=frozen/active` 过滤） |
 
 ### 核验与占用规则
 
@@ -280,6 +284,65 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   （`POST /distributions/{id}/revoke`，仅可一次），撤销释放额度后
   同样会触发本通道队首重算；也可查询、改期、参与授权改挂。
 
+### 通道额度冻结/恢复规则
+
+发行团队可按**地区 + 渠道**临时冻结新额度发放
+（`PUT /api/v1/channel-freezes`，请求体
+`{"region": "CN", "channel": "web", "status": "frozen", "reason": "..."}`；
+恢复传 `"status": "active"`，无需原因）。冻结状态记录在通道维度
+（`channel_freezes` 表，启动时随其他表幂等创建），冻结/恢复与同通道
+全部发行写事务共用**同一把通道咨询锁**，因此同通道严格串行，
+跨通道互不影响。
+
+**冻结期间的明确拒绝（不占额、不入队）**：
+
+- 新的**直接发行** `POST /distributions` → 422 `channel_frozen`；
+- 新的**额度预留** `POST /reservations` → 422 `channel_frozen`；
+- 新的**候补受理** `POST /waitlists` → 422 `channel_frozen`
+  （即使额度充足也拒绝，不生成候补记录）。
+
+**冻结期间仍允许的既有操作**（语义与非冻结期一致）：
+
+- 既有未到期预留仍可**确认**（槽位转正式占用）或**取消**（释放预留）；
+- 已通过申请仍可**撤销**或**改期**；
+- 授权仍可**退役改挂**（含原授权有未到期预留的既有拒绝条件）；
+- 已受理的候补仍可**取消**。
+- 但以上操作**释放出的额度一律不得使候补成交**：冻结期通道写事务只做
+  到期/有效期结算与状态推进，队首候补一律保持 `pending`。
+
+**冻结不延长任何有效期**：
+
+- 到期预留仍按原 `expires_at` 在通道锁内**惰性结算**为 `expired` 并归还
+  `reserved_count`（左闭右开边界不变，逾期确认仍 409）；
+- 候补仍按原申请有效期失效：冻结期内处理通道时
+  `expires_at <= now` 的候补照常标记 `expired`（记录 `expired_at` 与
+  `ttl_expired`）并让出队列位置。
+
+**恢复（`status=active`）时的顺序**：在同一个通道锁事务内，先结算
+到期预留、统一失效过期候补，再**按原受理顺序（`id` 升序）处理本通道
+仍有效的候补**——可整体承接者原子占额转为 `approved` 申请、授权不再
+匹配者标记 `failed`、仍额度不足者留在队首；该事务提交后通道才放通，
+随后的新直接发行/预留/候补受理才能占额。因此积压候补**严格优先于**
+恢复后的新请求，新请求不会插队抢走候补额度。
+
+**状态、原因与时刻**：`GET /api/v1/channel-freezes/{region}/{channel}`
+返回 `status`（`frozen`/`active`；有授权但从未冻结的通道派生为
+`active`，各时刻为 `null`）、冻结 `reason`、`frozen_at`、
+`unfrozen_at` 与最近变更时刻 `changed_at`。
+
+- **重复同态操作幂等**：已 `frozen` 再冻结（即使携带不同原因）与已
+  `active`（或无冻结记录）再恢复，都不改动原因与 `changed_at`，
+  返回当前状态；
+- **冻结 → 恢复 → 再冻结**属于状态翻转，再冻结须重新提供原因，
+  并记录新的原因与变更时刻；
+- 恢复后 `reason`、`frozen_at` 清空，`unfrozen_at` 记录恢复时刻。
+
+**错误**：目标通道不存在任何授权 → 422 `channel_without_authorization`；
+冻结缺少/空白原因 → 422 `freeze_reason_required`；`status` 非
+`frozen`/`active` → 422 `invalid_freeze_status`；查询一个既无授权也无
+冻结记录的通道 → 404 `not_found`。冻结只影响本通道，**其他通道的全部
+接口与额度语义不受影响**。
+
 ### 错误响应格式
 
 所有业务错误统一为：
@@ -324,7 +387,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 409 | `waitlist_already_failed` | 对已失败（授权不再匹配）候补执行取消 |
 | 409 | `waitlist_already_expired` | 对已超过申请有效期失效（`expired`）的候补执行取消 |
 | 422 | `invalid_waitlist_status` | 候补列表使用了不支持的状态过滤值 |
-| 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在） |
+| 422 | `channel_frozen` | 通道冻结期间提交新的直接发行/额度预留/候补受理（不占额、不入队） |
+| 422 | `channel_without_authorization` | 冻结/恢复的目标通道不存在任何授权 |
+| 422 | `freeze_reason_required` | 冻结通道时未填写（非空）冻结原因 |
+| 422 | `invalid_freeze_status` | 冻结状态值非法（仅支持 frozen/active），或列表使用了非法状态过滤值 |
+| 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在）；查询既无授权也无冻结记录的通道 |
 
 `distribution_rejected` / `reschedule_rejected` / `reservation_rejected`
 / `waitlist_rejected` 的逐项原因 `reason`：
@@ -565,6 +632,80 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=expired"
 # 非法过滤值 -> 422 invalid_waitlist_status
 ```
 
+### 通道冻结/恢复示例（curl）
+
+```bash
+# 22) 冻结 CN/web 通道的新额度发放（冻结必须填写原因）
+curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
+  -H 'Content-Type: application/json' \
+  -d '{"region": "CN", "channel": "web",
+       "status": "frozen", "reason": "双十一风控核查，暂停新额度发放"}'
+# 200：{"region": "CN", "channel": "web", "status": "frozen",
+#       "reason": "双十一风控核查，暂停新额度发放",
+#       "frozen_at": "2026-10-06T01:17:56.331505Z",
+#       "unfrozen_at": null, "changed_at": "2026-10-06T01:17:56.331505Z"}
+
+# 23) 查询通道当前状态（原因与变更时刻）
+curl -s http://localhost:8000/api/v1/channel-freezes/CN/web
+
+# 24) 冻结期：新直接发行 / 新预留 / 新候补一律拒绝（不占额、不入队）
+curl -s -X POST http://localhost:8000/api/v1/distributions \
+  -H 'Content-Type: application/json' \
+  -d '{"material_ids": [1], "region": "CN", "channel": "web",
+       "occur_at": "2026-10-15T12:00:00+08:00"}'
+# 422：{"error": {"code": "channel_frozen", ...}}
+curl -s -X POST http://localhost:8000/api/v1/reservations   # -> 422 channel_frozen
+curl -s -X POST http://localhost:8000/api/v1/waitlists      # -> 422 channel_frozen
+
+# 冻结期既有操作仍允许（这些操作释放的额度不会使候补成交）：
+curl -s -X POST http://localhost:8000/api/v1/reservations/1/confirm
+curl -s -X POST http://localhost:8000/api/v1/reservations/1/cancel
+curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
+curl -s -X POST http://localhost:8000/api/v1/distributions/1/reschedule \
+  -H 'Content-Type: application/json' \
+  -d '{"occur_at": "2026-10-21T10:00:00+08:00"}'
+
+# 25) 重复同态冻结：幂等，不改动原因与变更时刻（即使携带不同原因）
+curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
+  -H 'Content-Type: application/json' \
+  -d '{"region": "CN", "channel": "web", "status": "frozen", "reason": "另一个原因"}'
+# 200：reason/frozen_at/changed_at 与首次冻结完全一致
+
+# 26) 恢复：同一通道锁事务内先按原受理顺序处理仍有效候补（先占额），
+#     再放通新请求；返回 unfrozen_at
+curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
+  -H 'Content-Type: application/json' \
+  -d '{"region": "CN", "channel": "web", "status": "active"}'
+# 200：{"status": "active", "reason": null, "frozen_at": null,
+#       "unfrozen_at": "2026-10-06T02:00:00Z", "changed_at": "..."}
+
+# 重复恢复同样幂等（unfrozen_at/changed_at 不再变化）
+curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
+  -H 'Content-Type: application/json' \
+  -d '{"region": "CN", "channel": "web", "status": "active"}'
+
+# 27) 列表与过滤
+curl -s http://localhost:8000/api/v1/channel-freezes
+curl -s "http://localhost:8000/api/v1/channel-freezes?status=frozen"
+curl -s "http://localhost:8000/api/v1/channel-freezes?status=active"
+
+# 28) 错误场景
+# 冻结缺少原因 -> 422 freeze_reason_required
+curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
+  -H 'Content-Type: application/json' \
+  -d '{"region": "CN", "channel": "web", "status": "frozen"}'
+# 非法状态     -> 422 invalid_freeze_status（?status= 过滤非法同码）
+curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
+  -H 'Content-Type: application/json' \
+  -d '{"region": "CN", "channel": "web", "status": "paused"}'
+# 不存在授权的通道 -> 422 channel_without_authorization
+curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
+  -H 'Content-Type: application/json' \
+  -d '{"region": "ZZ", "channel": "nope", "status": "frozen", "reason": "x"}'
+# 查询既无授权也无冻结记录的通道 -> 404 not_found
+curl -s http://localhost:8000/api/v1/channel-freezes/ZZ/nope
+```
+
 候补成交响应示例（注意 `distribution_id`、内嵌的完整申请，
 以及申请有效期 `ttl_minutes` / `expires_at`）：
 
@@ -706,13 +847,21 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=expired"
 
 ```
 通道咨询锁 pg_advisory_xact_lock(region+channel)
-        → 到期预留惰性结算（reservations / authorizations）
+        → 通道冻结状态检查（frozen：新发行/新预留/新候补直接拒绝）
+        → 到期预留惰性结算（reservations / authorizations；冻结期只结算不成单）
         → 候补有效期失效结算（expires_at <= now 的 pending → expired）
-        → 候补队列处理（waitlists，受理顺序逐队首）
+        → 候补队列处理（waitlists，受理顺序逐队首；冻结期跳过成交）
         → 预留/申请/候补行锁（id 升序）
         → 授权行锁（authorizations，id 升序）
         → 明细行锁（distribution/reservation/waitlist_items，id 升序）
 ```
+
+> **冻结/恢复与发行的串行化**：冻结状态保存在通道维度
+> （`channel_freezes`），冻结（`PUT`）与恢复都在本通道咨询锁内完成；
+> 恢复事务在放通（置 `active`）前先完成到期结算、过期失效与候补队列
+> 按序成交，事务提交后新请求才可能读到非冻结状态。因此「冻结/恢复」
+> 与「同通道发行」天然按通道串行，不存在冻结生效后仍有新占额提交、
+> 或恢复后新请求抢先于积压候补占额的窗口。
 
 1. **通道咨询锁 `pg_advisory_xact_lock`**：按 `region+channel` 分桶，
    同一通道内的提交、预留、确认、取消、撤销、改期、改挂、候补受理与
@@ -805,6 +954,15 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=expired"
   原因）并释放位置、其后有效候补按序成交、有效期内正常成交、查询惰性
   失效与列表派生 expired、取消过期 409、过期不占额不阻塞新申请、
   多笔过期一次性清理**，以及账实相符。
+- `tests/test_freezes.py`：102 项通道冻结/恢复端到端与并发用例，覆盖
+  冻结/恢复/查询的状态-原因-时刻回显、重复同态不改写原因与时刻、
+  再冻结更新原因、非法状态/缺失原因/无授权通道 422、未知通道 404、
+  冻结期新直接发行/预留/候补受理拒绝且不占额、其他通道不受影响、
+  冻结期既有预留确认/取消、申请撤销/改期、授权改挂、候补取消仍允许但
+  **释放额度不成交候补**、到期预留与候补有效期仍按原时刻结算
+  （冻结不延长）、恢复时按受理顺序先成交积压候补（含过期让位、
+  多候补 FIFO 占满后新申请被拒），以及冻结/恢复与发行并发按通道串行
+  （不超额、原因时刻不被并发重复操作改写）。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -817,6 +975,7 @@ python3 -m tests.test_reschedule
 python3 -m tests.test_concurrency
 python3 -m tests.test_reservations
 python3 -m tests.test_waitlist
+python3 -m tests.test_freezes
 ```
 
 > 测试会先 `DROP` 再重建全部表，请勿指向含生产数据的数据库。
@@ -835,11 +994,13 @@ python3 -m tests.test_waitlist
 │   ├── config.py      # 环境变量配置（含预留 TTL 1～30 范围）
 │   ├── database.py    # 引擎/会话/启动建表（旧库幂等补齐 reserved_count 与候补表）
 │   ├── models.py      # Material / Authorization / Distribution(+Item) /
-│   │                  # Reservation(+Item) / Waitlist(+Item)
-│   ├── schemas.py     # 请求响应模型与时段/时区/TTL 校验
-│   ├── errors.py      # 业务错误码（含预留四态冲突码、改期拒绝码与候补状态码）
+│   │                  # Reservation(+Item) / Waitlist(+Item) / ChannelFreeze
+│   ├── schemas.py     # 请求响应模型与时段/时区/TTL 校验（含通道冻结模型）
+│   ├── errors.py      # 业务错误码（含预留四态冲突码、改期拒绝码、候补状态码、
+│   │                  # 通道冻结 channel_frozen 等错误码）
 │   └── services.py    # 核验占用 / 预留 / 确认 / 取消 / 到期结算 /
-│                      # 撤销 / 改期 / 改挂 / 候补受理与队列成交（核心事务逻辑）
+│                      # 撤销 / 改期 / 改挂 / 候补受理与队列成交 /
+│                      # 通道冻结与恢复（核心事务逻辑）
 └── tests/
     ├── test_api.py
     ├── test_migrate.py
@@ -847,5 +1008,6 @@ python3 -m tests.test_waitlist
     ├── test_reschedule.py
     ├── test_reservations.py
     ├── test_waitlist.py
+    ├── test_freezes.py
     └── test_concurrency.py
 ```
